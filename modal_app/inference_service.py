@@ -6,7 +6,8 @@ The module defines a single Modal App exposing one class that:
 * loads every supported class-specific model on container startup and
   keeps them cached for the container's lifetime,
 * serves a FastAPI ASGI application with Label Studio ML backend
-  endpoints (``/health``, ``/setup``, ``/predict``).
+  endpoints (``/health``, ``/setup``, ``/predict``) plus a multipart
+  upload endpoint (``/predict-file``) for local files.
 
 All SAHI patching and weighted boxes fusion logic is reused from
 ``pipeline/inference.py`` and ``pipeline/aggregation.py`` without
@@ -16,6 +17,7 @@ modification.
 import hashlib
 import json
 import os
+from io import BytesIO
 
 import modal
 
@@ -69,6 +71,7 @@ app = modal.App(name=_settings.modal_app_name)
     volumes={_settings.volume_mount_path: _volume},
     timeout=_settings.request_timeout_seconds,
     secrets=[_runtime_secret],
+    max_containers=3,
 )
 class InferenceService:
     @modal.enter()
@@ -92,7 +95,8 @@ class InferenceService:
 
     @modal.asgi_app()
     def fastapi_app(self):
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+        from PIL import Image, UnidentifiedImageError
         from pydantic import ValidationError
 
         from pipeline.aggregation import apply_wbf, filter_by_score
@@ -101,6 +105,7 @@ class InferenceService:
         from .label_studio_adapter import (
             PredictionParams,
             PredictRequest,
+            PredictRequestParams,
             SetupRequest,
             derive_label_studio_base_url,
             first_non_none,
@@ -149,15 +154,61 @@ class InferenceService:
                     },
                 )
 
+        def _effective_global_overlap_fraction(per_call, runtime) -> float:
+            return first_non_none(
+                per_call.overlap_fraction if per_call is not None else None,
+                runtime.overlap_fraction if runtime is not None else None,
+                settings.default_overlap_fraction,
+            )
+
+        def _effective_global_wbf_iou_threshold(per_call, runtime) -> float:
+            return first_non_none(
+                per_call.wbf_iou_threshold if per_call is not None else None,
+                runtime.wbf_iou_threshold if runtime is not None else None,
+                settings.default_wbf_iou_threshold,
+            )
+
+        def _effective_class_overlap_fraction(
+            call_override,
+            runtime_override,
+            per_call,
+            runtime,
+        ) -> float:
+            return first_non_none(
+                call_override.overlap_fraction if call_override is not None else None,
+                per_call.overlap_fraction if per_call is not None else None,
+                runtime_override.overlap_fraction if runtime_override is not None else None,
+                runtime.overlap_fraction if runtime is not None else None,
+                settings.default_overlap_fraction,
+            )
+
+        def _effective_class_wbf_iou_threshold(
+            call_override,
+            runtime_override,
+            per_call,
+            runtime,
+        ) -> float:
+            return first_non_none(
+                call_override.wbf_iou_threshold if call_override is not None else None,
+                per_call.wbf_iou_threshold if per_call is not None else None,
+                runtime_override.wbf_iou_threshold if runtime_override is not None else None,
+                runtime.wbf_iou_threshold if runtime is not None else None,
+                settings.default_wbf_iou_threshold,
+            )
+
         def _prediction_model_version(
-            overlap_fraction: float,
-            wbf_iou_threshold: float,
+            per_call,
+            runtime,
             per_call_per_class: dict,
             runtime_per_class: dict,
         ) -> str:
             effective_params = {
-                "overlap_fraction": float(overlap_fraction),
-                "wbf_iou_threshold": float(wbf_iou_threshold),
+                "overlap_fraction": float(
+                    _effective_global_overlap_fraction(per_call, runtime)
+                ),
+                "wbf_iou_threshold": float(
+                    _effective_global_wbf_iou_threshold(per_call, runtime)
+                ),
                 "per_class": {},
             }
             for entry in registry:
@@ -185,6 +236,22 @@ class InferenceService:
                             settings.default_confidence_threshold,
                         )
                     ),
+                    "overlap_fraction": float(
+                        _effective_class_overlap_fraction(
+                            call_override,
+                            runtime_override,
+                            per_call,
+                            runtime,
+                        )
+                    ),
+                    "wbf_iou_threshold": float(
+                        _effective_class_wbf_iou_threshold(
+                            call_override,
+                            runtime_override,
+                            per_call,
+                            runtime,
+                        )
+                    ),
                 }
 
             fingerprint = hashlib.sha256(
@@ -193,6 +260,127 @@ class InferenceService:
                 )
             ).hexdigest()[:10]
             return f"{settings.model_version}__cfg-{fingerprint}"
+
+        def _parse_form_params(params: str | None) -> PredictRequestParams | None:
+            if params is None or params.strip() == "":
+                return None
+            try:
+                raw = json.loads(params)
+            except json.JSONDecodeError as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"params must be valid JSON: {error}",
+                ) from error
+            if not isinstance(raw, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="params JSON must decode to an object.",
+                )
+            try:
+                parsed = PredictRequestParams.model_validate(raw)
+            except ValidationError as error:
+                raise HTTPException(status_code=400, detail=error.errors()) from error
+            _reject_unknown_class_keys(parsed.per_class)
+            return parsed
+
+        def _predict_loaded_images(
+            images: list[tuple[int | str | None, object]],
+            per_call: PredictRequestParams | None,
+        ) -> dict:
+            per_call_per_class = per_call.per_class if per_call is not None else {}
+            _reject_unknown_class_keys(per_call_per_class)
+
+            runtime = runtime_state["defaults"]
+            runtime_per_class = runtime.per_class if runtime is not None else {}
+
+            prediction_model_version = _prediction_model_version(
+                per_call=per_call,
+                runtime=runtime,
+                per_call_per_class=per_call_per_class,
+                runtime_per_class=runtime_per_class,
+            )
+            print(
+                "[inference-service] predict effective version: "
+                f"{prediction_model_version}"
+            )
+
+            task_results: list[dict] = []
+            for task_id, pil_image in images:
+                image_width, image_height = pil_image.size
+                merged_predictions: list = []
+
+                for entry in registry:
+                    call_override = per_call_per_class.get(entry.class_key)
+                    runtime_override = runtime_per_class.get(entry.class_key)
+                    enabled = bool(
+                        first_non_none(
+                            call_override.enabled if call_override is not None else None,
+                            runtime_override.enabled if runtime_override is not None else None,
+                            True,
+                        )
+                    )
+                    if not enabled:
+                        print(
+                            "[inference-service] skipping disabled class during predict: "
+                            f"task_id={task_id!r} class_key={entry.class_key}"
+                        )
+                        continue
+                    patch_size = first_non_none(
+                        call_override.patch_size if call_override is not None else None,
+                        runtime_override.patch_size if runtime_override is not None else None,
+                        entry.training_patch_size,
+                    )
+                    confidence_threshold = first_non_none(
+                        call_override.confidence_threshold if call_override is not None else None,
+                        runtime_override.confidence_threshold if runtime_override is not None else None,
+                        settings.default_confidence_threshold,
+                    )
+                    class_overlap_fraction = _effective_class_overlap_fraction(
+                        call_override,
+                        runtime_override,
+                        per_call,
+                        runtime,
+                    )
+                    class_wbf_iou_threshold = _effective_class_wbf_iou_threshold(
+                        call_override,
+                        runtime_override,
+                        per_call,
+                        runtime,
+                    )
+
+                    inference_result = run_sahi_inference(
+                        model=models[entry.class_key],
+                        image=pil_image,
+                        patch_size=patch_size,
+                        overlap_fraction=class_overlap_fraction,
+                        score_threshold=confidence_threshold,
+                        category_id_override=entry.category_id,
+                    )
+                    filtered = filter_by_score(
+                        inference_result.predictions, confidence_threshold
+                    )
+                    aggregated = apply_wbf(
+                        filtered,
+                        image_width=inference_result.image_width,
+                        image_height=inference_result.image_height,
+                        iou_threshold=class_wbf_iou_threshold,
+                    )
+                    merged_predictions.extend(aggregated)
+
+                task_results.append(
+                    predictions_to_ls_result(
+                        aggregated_predictions=merged_predictions,
+                        image_width=image_width,
+                        image_height=image_height,
+                        mapping=mapping,
+                        model_version=prediction_model_version,
+                    )
+                )
+
+            return {
+                "results": task_results,
+                "model_version": prediction_model_version,
+            }
 
         api = FastAPI(
             title="RF-DETR SAHI Label Studio Backend",
@@ -244,34 +432,7 @@ class InferenceService:
         @api.post("/predict")
         def predict(request: PredictRequest) -> dict:
             per_call = request.params
-            per_call_per_class = per_call.per_class if per_call is not None else {}
-            _reject_unknown_class_keys(per_call_per_class)
-
-            runtime = runtime_state["defaults"]
-            runtime_per_class = runtime.per_class if runtime is not None else {}
-
-            overlap_fraction = first_non_none(
-                per_call.overlap_fraction if per_call is not None else None,
-                runtime.overlap_fraction if runtime is not None else None,
-                settings.default_overlap_fraction,
-            )
-            wbf_iou_threshold = first_non_none(
-                per_call.wbf_iou_threshold if per_call is not None else None,
-                runtime.wbf_iou_threshold if runtime is not None else None,
-                settings.default_wbf_iou_threshold,
-            )
-            prediction_model_version = _prediction_model_version(
-                overlap_fraction=overlap_fraction,
-                wbf_iou_threshold=wbf_iou_threshold,
-                per_call_per_class=per_call_per_class,
-                runtime_per_class=runtime_per_class,
-            )
-            print(
-                "[inference-service] predict effective version: "
-                f"{prediction_model_version}"
-            )
-
-            task_results: list[dict] = []
+            loaded_images = []
             for task in request.tasks:
                 try:
                     pil_image = resolve_image(
@@ -298,69 +459,27 @@ class InferenceService:
                         f"detail={error}"
                     )
                     raise HTTPException(status_code=400, detail=str(error)) from error
+                loaded_images.append((task.id, pil_image))
+            return _predict_loaded_images(loaded_images, per_call)
 
-                image_width, image_height = pil_image.size
-                merged_predictions: list = []
+        @api.post("/predict-file")
+        async def predict_file(
+            image: UploadFile = File(...),
+            params: str | None = Form(default=None),
+            task_id: str | None = Form(default=None),
+        ) -> dict:
+            per_call = _parse_form_params(params)
+            content = await image.read()
+            try:
+                with Image.open(BytesIO(content)) as raw:
+                    pil_image = raw.convert("RGB")
+            except (UnidentifiedImageError, OSError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Uploaded file is not a supported image: {error}",
+                ) from error
 
-                for entry in registry:
-                    call_override = per_call_per_class.get(entry.class_key)
-                    runtime_override = runtime_per_class.get(entry.class_key)
-                    enabled = bool(
-                        first_non_none(
-                            call_override.enabled if call_override is not None else None,
-                            runtime_override.enabled if runtime_override is not None else None,
-                            True,
-                        )
-                    )
-                    if not enabled:
-                        print(
-                            "[inference-service] skipping disabled class during predict: "
-                            f"task_id={task.id!r} class_key={entry.class_key}"
-                        )
-                        continue
-                    patch_size = first_non_none(
-                        call_override.patch_size if call_override is not None else None,
-                        runtime_override.patch_size if runtime_override is not None else None,
-                        entry.training_patch_size,
-                    )
-                    confidence_threshold = first_non_none(
-                        call_override.confidence_threshold if call_override is not None else None,
-                        runtime_override.confidence_threshold if runtime_override is not None else None,
-                        settings.default_confidence_threshold,
-                    )
-
-                    inference_result = run_sahi_inference(
-                        model=models[entry.class_key],
-                        image=pil_image,
-                        patch_size=patch_size,
-                        overlap_fraction=overlap_fraction,
-                        score_threshold=confidence_threshold,
-                        category_id_override=entry.category_id,
-                    )
-                    filtered = filter_by_score(
-                        inference_result.predictions, confidence_threshold
-                    )
-                    aggregated = apply_wbf(
-                        filtered,
-                        image_width=inference_result.image_width,
-                        image_height=inference_result.image_height,
-                        iou_threshold=wbf_iou_threshold,
-                    )
-                    merged_predictions.extend(aggregated)
-
-                task_results.append(
-                    predictions_to_ls_result(
-                        aggregated_predictions=merged_predictions,
-                        image_width=image_width,
-                        image_height=image_height,
-                        mapping=mapping,
-                        model_version=prediction_model_version,
-                    )
-                )
-
-            return {
-                "results": task_results,
-                "model_version": prediction_model_version,
-            }
+            resolved_task_id = task_id or image.filename
+            return _predict_loaded_images([(resolved_task_id, pil_image)], per_call)
 
         return api
